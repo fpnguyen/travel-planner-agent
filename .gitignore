@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+travel_planner/.env
+*.egg-info/
+.DS_Store
+travel_planner/.adk/

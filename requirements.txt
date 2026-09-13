@@ -1,0 +1,7 @@
+# >=2.7.0 because this project uses google.adk.workflow (Workflow/JoinNode/node),
+# ADK's graph orchestration engine — not present in ADK 1.x.
+google-adk>=2.7.0
+# Duffel (flights) and Google Places (points of interest) are called via
+# plain REST — no dedicated SDK needed (Duffel's official Python client is
+# unmaintained; see tools/duffel_client.py).
+requests>=2.31.0
