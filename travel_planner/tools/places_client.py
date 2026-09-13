@@ -50,5 +50,21 @@ def places_request(path: str, body: dict, field_mask: str) -> dict:
     response = requests.post(
         f"{PLACES_API_BASE}{path}", headers=headers, json=body, timeout=30
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as error:
+        raise requests.HTTPError(_describe_places_error(response), response=response) from error
     return response.json()
+
+
+def _describe_places_error(response: requests.Response) -> str:
+    """Extracts Google's structured error message — response.raise_for_status()'s
+    default message only has the status code, which hides the actual reason
+    (e.g. API not enabled, billing not set up, bad field mask)."""
+    try:
+        detail = response.json().get("error", {})
+    except ValueError:
+        return f"{response.status_code} error from Google Places: {response.text[:500]}"
+
+    message = detail.get("message", "Unknown error")
+    return f"{response.status_code} error from Google Places: {message}"

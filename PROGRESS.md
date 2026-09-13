@@ -2,6 +2,191 @@
 
 ## Status: Complete scaffold, ready for testing
 
+### 2026-09-13: Coordinator miscalculated "next year"
+
+User asked for a trip "next year"; the coordinator resolved it to a date in
+`2026` — the *current* year, not next. Root cause: Gemini has no reliable
+built-in sense of the current date, and nothing in the coordinator's
+instruction ever told it — `root_agent.instruction` was a static string
+built once at module import time, so even if we'd hardcoded a date into it,
+that date would go stale on a long-running `adk web` process without a
+restart (and we already found plenty of multi-day-old leftover processes
+from earlier testing).
+
+Fixed by converting `root_agent`'s instruction from a plain string into an
+`InstructionProvider` callable (`_build_root_instruction`) — confirmed this
+is a real, first-class option by checking `LlmAgent.model_fields['instruction'].annotation`
+directly: `Union[str, Callable[[ReadonlyContext], Union[str, Awaitable[str]]]]`.
+ADK calls this fresh on every request rather than once at import time, so
+`date.today()` is computed at the moment each conversation turn actually
+happens. The function opens with an explicit "Today's date is {today};
+ground every relative date against this yourself, don't rely on your own
+sense of the current date" instruction.
+
+Verified directly: called `_build_root_instruction(None)` standalone and
+confirmed (a) it returns today's real date correctly, and (b) the `{user:
+interests?}` -style placeholders still pass through as literal text for
+ADK's own downstream state-injection to resolve later (this needed checking
+since moving to an f-string *inside* a function is an easy place to
+accidentally break the double-brace escaping). `adk web` still boots clean
+with the new callable-based instruction.
+
+This fix only applies to the root coordinator, which is the one place
+relative-date language like "next year" actually gets interpreted —
+`booking_agent`/`itinerary_planner_agent`/`packing_agent`/
+`destination_recommender_agent` all receive already-resolved absolute
+YYYY-MM-DD dates from the coordinator, so they don't independently need to
+know "today."
+
+### 2026-09-13: Two real bugs from first live use
+
+**1. `PydanticSerializationError: Unable to serialize unknown type: <class 'coroutine'>`**
+`export_trip_plan_to_excel` called `tool_context.save_artifact(...)` without
+`await`. Checked directly: `inspect.iscoroutinefunction(ToolContext.save_artifact)`
+→ `True` — it's async. Without awaiting it, the call returns an unawaited
+coroutine object instead of the actual version int, and that coroutine ends
+up inside the tool's return dict, which is what ADK then fails to serialize.
+Fixed by making `export_trip_plan_to_excel` itself `async def` and awaiting
+the call. Re-verified the tool's declared schema is unaffected (`tool_context`
+still correctly excluded from what the LLM sees) after the change.
+
+**2. Duffel `422` misread as "no flights exist for this route"**
+User saw a 422 for DFW→PEK/PKX and asked if that meant no flights existed
+between those airports. Checked directly against the live Duffel API rather
+than guessing: DFW→PEK, DFW→PKX, and a DFW↔PEK round trip *all* returned real
+`201` offers immediately. A 422 is Duffel's signal that **the request itself
+was invalid** — a genuinely empty search comes back as `200` with an empty
+`offers` list, not a 422. So the premise was wrong; the actual bug was that
+`duffel_client.py`'s `response.raise_for_status()` discards the response
+body, which is exactly where Duffel puts the specific reason. Confirmed by
+deliberately triggering a real 422 (a past departure date) and inspecting the
+body directly:
+```json
+{"errors": [{"source": {"field": "departure_date"}, "message": "Field 'departure_date' must be after 2026-09-11", "code": "invalid_date"}]}
+```
+Fixed `duffel_client.py` to catch the `HTTPError` and re-raise with that
+detail extracted (field + message), so `search_flights`'s `error_message` is
+now specific instead of a bare "422 Client Error: Unprocessable Entity."
+Applied the identical fix to `places_client.py` (same swallowed-body pattern,
+Google's own `{"error": {"message": ...}}` shape). Also added an explicit
+instruction to `booking_agent`: a `search_flights` error means the request
+was rejected, not that the route has no availability — don't conflate the two
+regardless of what the error text says.
+
+Re-verified both fixes against the live APIs (not mocked): the error path now
+returns `"422 error from Duffel: departure_date: Field 'departure_date' must
+be after 2026-09-11"` instead of the old generic message, and the success
+path (a valid date) still returns 5 real offers as before.
+
+### 2026-09-12: Weather-aware packing + Excel export
+
+Two new connectors, both verified against live/real data before wiring into
+agents (no mocks):
+
+**Packing (`travel_planner/tools/weather_tools.py` + `sub_agents/packing_agent/`)**
+- `get_weather_outlook(lat, lon, start_date, end_date)` calls Open-Meteo (no
+  API key needed for non-commercial use, confirmed from their docs).
+- Trip within ~15 days → real forecast API (`api.open-meteo.com/v1/forecast`).
+- Trip further out (the common case) → Open-Meteo's forecast doesn't exist
+  yet, so this averages the same calendar dates from the last 3 years via
+  their Historical Weather API (`archive-api.open-meteo.com/v1/archive`)
+  instead, clearly labeled `"historical_average"` with a note that it's an
+  estimate, not a forecast. Deliberately did *not* use Open-Meteo's separate
+  "Climate API" — that's actually a climate-*projection* model output (named
+  models like CMCC_CM2_VHR4, scenario horizons to 2050), the wrong shape for
+  "what's typical weather here in October."
+- Both branches tested against the real API (no key required) before writing
+  a single line of agent code: near-term request correctly hit the forecast
+  path, far-out request correctly hit the historical-average path and
+  returned sensible numbers.
+- `packing_agent` is a new third branch in the `Workflow`'s parallel fan-out
+  (`(START, seed_node, (booking_node, itinerary_node, packing_node),
+  trip_specialists_join, merge_node)`) — confirmed the graph rebuilds
+  correctly with 3-way fan-out/fan-in by printing its nodes/edges directly.
+  Renamed the join node `trip_specialists_join` (was `booking_itinerary_join`)
+  since it now waits on three branches, not two.
+- `plan_merger_agent` updated to read `{packing_result}` alongside the other
+  two and include it in the final plan, forwarding the forecast-vs-estimate
+  caveat verbatim rather than dropping it.
+
+**Excel export (`travel_planner/tools/excel_export_tools.py`)**
+- `export_trip_plan_to_excel(...)` builds a 3-sheet workbook (Overview,
+  Itinerary, Packing List) with `openpyxl`, then saves it via
+  `tool_context.save_artifact()` — confirmed this is the right mechanism by
+  checking `ToolContext`'s actual methods (`save_artifact`, `load_artifact`,
+  `list_artifacts`) directly, and confirmed `google.genai.types.Part.from_bytes(data=,
+  mime_type=)` is the correct way to wrap binary content for it. Using the
+  artifact system means the file shows up as a real downloadable attachment
+  in `adk web`'s chat UI, not just a path on the server's local disk.
+  - Tested the workbook-building logic directly (not through the LLM):
+    wrote a real file, reopened it with `openpyxl.load_workbook`, and
+    confirmed sheet names, cell values, and that a day dict with missing
+    keys renders blank cells instead of raising.
+  - Opt-in only — the coordinator's instructions say never to export
+    automatically, only when the user asks to save/download/export.
+- No new credentials needed for either feature: Open-Meteo requires no API
+  key, and Excel export has no external dependency beyond the `openpyxl`
+  package (added to `requirements.txt`).
+
+### 2026-09-12: Cross-session user memory
+
+Added `travel_planner/tools/memory_tools.py` (`remember_trip_preferences`,
+`remember_completed_trip`) so the coordinator remembers a user's interests,
+preferred travel class, flight stop tolerance, and past planned trips across
+*separate* conversations, not just within one chat.
+
+Built entirely on ADK's existing `user:`-prefixed session state — no new
+infrastructure. Verified directly, not assumed:
+- `SqliteSessionService` (what `adk web` uses by default for local
+  persistence — confirmed by finding `create_local_database_session_service`
+  in `google/adk/cli/.../local_storage.py`, which creates exactly this class
+  at `.adk/session.db`) keeps `user:`-prefixed state in a separate table and
+  re-merges it into every new session for that `user_id`.
+- Proved this survives a full process restart, not just a new session: wrote
+  `user:` state via one `SqliteSessionService` instance, dropped it, created
+  a **brand-new** instance pointed at the same `.db` file (functionally
+  identical to killing and restarting `adk web`), created a new session for
+  the same user — the remembered facts were already in its initial state.
+- Confirmed `adk web`'s browser UI hardcodes `userId="user"` (found by
+  grepping the shipped bundled JS directly — no `crypto.randomUUID` or
+  `localStorage` involved) — so refreshing the page keeps the same identity,
+  which is what makes this testable through the UI at all.
+- A tool gets write access via a `tool_context: ToolContext` parameter, which
+  ADK auto-injects and hides from the schema the LLM sees (confirmed by
+  inspecting `canonical_tools()`'s resolved declarations — `tool_context`
+  never appears in either new tool's parameter list).
+- Exercised both tool functions directly against a real `State` object
+  (bypassing the LLM entirely) and confirmed correct writes, including that
+  `remember_completed_trip` appends to a list rather than overwriting it.
+
+Coordinator instructions now open with `{user:interests?}` /
+`{user:preferred_travel_class?}` / `{user:flight_stop_tolerance?}` /
+`{user:trip_history?}` (the trailing `?` makes each optional — empty string
+if unset) so a returning user's profile is simply present in the prompt, and
+call the two remember tools as a final, silent step after presenting a plan.
+
+**Caveat**: this only works if the same `user_id` is used across sessions.
+Fine for local `adk web` testing (hardcoded to `"user"`); a real multi-user
+deployment would need your own auth layer supplying a stable per-user ID.
+
+### 2026-09-12: Live testing — model name fix + rate limit finding
+
+First live run (real Gemini/Duffel/Google Places credentials) surfaced two
+things, both from real API responses, not guesses:
+- `gemini-2.5-flash` (hardcoded in all 5 agents) returned `404 NOT_FOUND`:
+  "This model is no longer available to new users... use models/gemini-3.6-flash."
+  Updated across all agents.
+- Free-tier Gemini quota is 5 requests/minute per model. A single trip-planning
+  turn through this app needs far more than that (coordinator's own reasoning
+  + booking_step's and itinerary_step's internal tool-calling turns, running
+  concurrently, + plan_merge_step + coordinator's final synthesis — easily
+  10-15+ calls). A full live run wasn't completed end-to-end as a result, but
+  the stack trace during the attempt showed `run_llm_agent_as_node` actively
+  executing one of the Workflow's node-wrapped agents — real confirmation the
+  graph executes as designed, just data-starved on quota. Fix is enabling
+  billing on the Gemini API key's project (no code change needed) — left to
+  the user to do when ready.
+
 ### 2026-08-19: Migrated off Amadeus (Duffel + Google Places)
 
 Amadeus fully decommissioned its self-service API portal on 2026-07-17
@@ -50,8 +235,11 @@ A **multi-agent Google ADK project** structured to plan end-to-end trips within 
   - Reads user certainty at each decision point and tells specialists whether
     to auto-select or return multiple options (see Certainty & Budget Buffer below)
   - Calls `trip_planning_pipeline` — a graph-based `Workflow` (see below) — once
-    it has everything, which runs booking and itinerary planning **concurrently**
-    rather than one after another, then presents the merged, reconciled result
+    it has everything, which runs booking, itinerary, and packing planning
+    **concurrently** rather than one after another, then presents the merged,
+    reconciled result
+  - Calls `export_trip_plan_to_excel` when (and only when) the user asks to
+    save/export/download the plan
 
 - **Destination Recommender** (`travel_planner/sub_agents/destination_recommender/agent.py`)
   - For users who don't know where to go
@@ -75,12 +263,20 @@ A **multi-agent Google ADK project** structured to plan end-to-end trips within 
   - Stays within activities budget (total budget minus transportation)
   - Returns itinerary with running cost estimates
 
-#### Tools (Duffel + Google Places API wrappers)
+- **Packing Specialist** (`travel_planner/sub_agents/packing_agent/agent.py`)
+  - Gets a real forecast or historical typical-conditions estimate via Open-Meteo
+  - Builds a weather- and interest-appropriate packing list
+  - Runs independently in the same parallel fan-out as booking/itinerary (doesn't touch budget)
+
+#### Tools (Duffel + Google Places + Open-Meteo API wrappers)
 
 - `resolve_city(city_name)` → IATA codes, coordinates, country code (Duffel Places Suggestions)
 - `search_flights(origin_iata, destination_iata, dates, ...)` → live offers with prices, stops, times (Duffel Offer Requests)
 - `search_points_of_interest(latitude, longitude, radius, category)` → real attractions, restaurants, shops (Google Places Nearby Search)
 - `get_city_info(city_name_or_iata)` → timezone, country, location details (Duffel Places Suggestions)
+- `get_weather_outlook(latitude, longitude, start_date, end_date)` → real forecast or historical average (Open-Meteo, no API key)
+- `remember_trip_preferences(...)` / `remember_completed_trip(...)` → cross-session user memory (see below)
+- `export_trip_plan_to_excel(...)` → downloadable `.xlsx` via ADK's artifact system
 
 #### Guardrails, Timeouts & Certainty-Aware Options
 
@@ -126,19 +322,23 @@ travel_planner/
 ├── sub_agents/
 │   ├── booking_agent/agent.py            (flight search)
 │   ├── itinerary_planner/agent.py        (day-by-day activities)
+│   ├── packing_agent/agent.py            (weather-aware packing list)
 │   ├── destination_recommender/agent.py  (destination brainstorming + price validation)
-│   ├── plan_merger/agent.py              (reconciles booking + itinerary into one plan)
+│   ├── plan_merger/agent.py              (combines all three, reconciles budget)
 │   └── parallel_pipeline.py              (the Workflow graph — see write-up above)
 └── tools/
     ├── duffel_client.py                  (shared Duffel REST client)
     ├── places_client.py                  (shared Google Places REST client)
+    ├── weather_tools.py                  (get_weather_outlook — Open-Meteo, no key needed)
+    ├── memory_tools.py                   (remember_trip_preferences, remember_completed_trip)
+    ├── excel_export_tools.py             (export_trip_plan_to_excel)
     ├── location_tools.py                 (resolve_city)
     ├── flight_tools.py                   (search_flights)
     ├── poi_tools.py                      (search_points_of_interest)
     └── destination_tools.py              (get_city_info)
 
 .env.example                              (copy to .env, fill in credentials)
-requirements.txt                          (google-adk>=2.7.0, requests)
+requirements.txt                          (google-adk>=2.7.0, requests, openpyxl)
 .gitignore                                (venv, __pycache__, .env)
 README.md                                 (setup, run, limitations)
 PROGRESS.md                               (this file)

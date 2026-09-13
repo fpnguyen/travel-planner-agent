@@ -53,5 +53,30 @@ def duffel_request(method: str, path: str, **kwargs) -> dict:
     response = requests.request(
         method, f"{DUFFEL_API_BASE}{path}", headers=headers, timeout=30, **kwargs
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as error:
+        raise requests.HTTPError(_describe_duffel_error(response), response=response) from error
     return response.json()
+
+
+def _describe_duffel_error(response: requests.Response) -> str:
+    """Extracts Duffel's structured error details, e.g. which field was
+    invalid and why — response.raise_for_status()'s default message only has
+    the status code, which hides exactly the information needed to tell "the
+    request was malformed" apart from "this route/date has no availability"."""
+    try:
+        errors = response.json().get("errors", [])
+    except ValueError:
+        return f"{response.status_code} error from Duffel: {response.text[:500]}"
+
+    if not errors:
+        return f"{response.status_code} error from Duffel with no error detail in the response body."
+
+    details = []
+    for err in errors:
+        field = err.get("source", {}).get("field")
+        detail = err.get("message") or err.get("title", "Unknown error")
+        details.append(f"{field}: {detail}" if field else detail)
+
+    return f"{response.status_code} error from Duffel: " + "; ".join(details)

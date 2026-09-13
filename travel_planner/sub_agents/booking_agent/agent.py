@@ -35,6 +35,13 @@ Steps:
    come from Duffel's test-mode sandbox, so expect a single fictional
    "Duffel Airways" carrier rather than real airlines — realistic pricing
    patterns for demonstration, not live inventory (see README).
+   - If it returns `status: "error"`, that means the *request* was rejected
+     (e.g. an invalid date, a malformed code) — `error_message` names the
+     specific field and reason. This is NOT the same as "no flights exist
+     for this route/date," which instead comes back as `status: "success"`
+     with an empty offers list. Report the actual reason from
+     `error_message` plainly; never say "no flights are available" for a
+     request-validation error, and never guess a reason you weren't given.
 3. Decide how to present results based on the certainty you were given:
    - If CERTAIN: auto-select one flight. Choose the cheapest offer that is
      non-stop or has at most 2 stops, and fits the budget. If nothing fits

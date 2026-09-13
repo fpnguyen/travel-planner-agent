@@ -4,14 +4,14 @@ plan_merger_agent = Agent(
     name="plan_merger_agent",
     model="gemini-3.6-flash",
     description=(
-        "Combines the booking and itinerary specialists' results — which ran "
-        "concurrently against pre-allocated budget estimates — into one final "
-        "trip plan, reconciling the real combined cost against the user's "
-        "stated total budget."
+        "Combines the booking, itinerary, and packing specialists' results — "
+        "which ran concurrently, booking/itinerary against pre-allocated budget "
+        "estimates — into one final trip plan, reconciling the real combined "
+        "cost against the user's stated total budget."
     ),
     instruction="""
-You run after booking_agent and itinerary_planner_agent have already finished,
-running in parallel. Their outputs:
+You run after booking_agent, itinerary_planner_agent, and packing_agent have
+all finished, running in parallel. Their outputs:
 
 BOOKING RESULT:
 {booking_result}
@@ -19,10 +19,14 @@ BOOKING RESULT:
 ITINERARY RESULT:
 {itinerary_result}
 
-Both specialists worked from an ESTIMATED budget split (e.g. ~40% of the total
-for transportation, ~60% for activities) rather than a hard sequential
-handoff, because they ran concurrently to save time. Your job is to reconcile
-that estimate against reality and produce one coherent final plan.
+PACKING RESULT:
+{packing_result}
+
+Booking and itinerary each worked from an ESTIMATED budget split (e.g. ~40%
+of the total for transportation, ~60% for activities) rather than a hard
+sequential handoff, because they ran concurrently to save time. Packing
+doesn't touch budget at all. Your job is to reconcile the budget estimate
+against reality and produce one coherent final plan covering all three.
 
 Steps:
 1. From the booking result, extract the recommended flight's total price.
@@ -48,14 +52,17 @@ Steps:
    b. Transportation details: flight (and alternatives if any).
    c. Day-by-day itinerary (or both themed variants if itinerary_planner_agent
       returned two, clearly labeled).
-5. Be transparent that flight data is from Duffel's test/sandbox environment
-   and points of interest from Google Places, used for recommendation
-   purposes only — the user books everything themselves, nothing here is an
-   actual purchase.
+   d. Packing list, including whether it's based on a real forecast or a
+      typical-conditions estimate — carry that caveat through verbatim rather
+      than dropping it.
+5. Be transparent that flight data is from Duffel's test/sandbox environment,
+   points of interest from Google Places, and weather from Open-Meteo, all
+   used for recommendation purposes only — the user books everything
+   themselves, nothing here is an actual purchase.
 
-Do not re-derive flight or activity details yourself, and do not call any
-tools — only reorganize, combine, and do the arithmetic on what booking_result
-and itinerary_result already reported.
+Do not re-derive flight, activity, or weather details yourself, and do not
+call any tools — only reorganize, combine, and do the arithmetic on what
+booking_result, itinerary_result, and packing_result already reported.
 """,
     tools=[],
 )
