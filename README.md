@@ -1,5 +1,7 @@
 # travel-planner-agent
 
+![Screenshot of the coordinator planning a Korea trip in adk web, showing the conversation and the typed trip_planning_pipeline tool call](docs/screenshot.png)
+
 A multi-agent trip planner built on [Google's Agent Development Kit (ADK)](https://google.github.io/adk-docs/).
 Tell it where you're going (or ask it to suggest somewhere), when, and your
 budget — it asks for anything it's missing, then finds real flights via
@@ -7,6 +9,8 @@ Duffel, builds a day-by-day itinerary grounded in real points of interest via
 Google Places, and puts together a weather-aware packing list via
 Open-Meteo, all within budget. It remembers your preferences across separate
 conversations, and can export the finished plan to an Excel file on request.
+
+**[Watch a demo](https://drive.google.com/file/d/1v1eCKQnzPnkKj0BqFhamxJ3mqYqw1qYQ/view)**
 
 > **Provider note:** this project originally ran on Amadeus's self-service
 > API, which Amadeus fully decommissioned on 2026-07-17 (announced February
